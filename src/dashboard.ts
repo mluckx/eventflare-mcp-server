@@ -297,7 +297,7 @@ export function getDashboardHtml(): string {
 
     async function loadData() {
       try {
-        const res = await fetch('/api/analytics');
+        const key = new URLSearchParams(window.location.search).get('key'); const res = await fetch('/api/analytics' + (key ? '?key=' + key : ''));
         const data = await res.json();
         render(data);
       } catch (err) {
