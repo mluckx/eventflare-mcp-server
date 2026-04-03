@@ -65,7 +65,7 @@ if (transport === "http") {
     }
 
     // Analytics dashboard
-    if (req.url === "/dashboard") {
+    if (req.url?.startsWith("/dashboard")) {
       const dashKey = process.env.DASHBOARD_KEY;
       if (dashKey) {
         const url = new URL(req.url, `http://${req.headers.host}`);
