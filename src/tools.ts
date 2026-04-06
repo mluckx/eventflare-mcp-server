@@ -1,6 +1,7 @@
 /**
  * MCP Tool definitions for Eventflare.
- * 6 tools that AI assistants can call to query venue data.
+ * 6 read-only tools that AI assistants can call to query venue data.
+ * All inputs are sanitized. All outputs exclude PII.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,16 +14,17 @@ import {
   getPricingGuide,
 } from "./strapi-client.js";
 import { logQuery } from "./analytics.js";
+import { sanitizeSlug, sanitizeEventType, sanitizeNumber, sanitizeDate, sanitizeRegion } from "./sanitize.js";
 
 const EVENTFLARE_URL = process.env.EVENTFLARE_URL || "https://eventflare.io";
 
 export function registerTools(server: McpServer): void {
   // ────────────────────────────────────────
-  // 1. search_venues (P0)
+  // 1. search_venues
   // ────────────────────────────────────────
   server.tool(
     "search_venues",
-    "Search for corporate event venues across 40+ cities worldwide on Eventflare. Returns venue names, capacities, pricing, features, and direct booking URLs.",
+    "Search for corporate event venues across 40+ cities worldwide on Eventflare. Returns venue names, capacities, pricing, features, and direct booking URLs. Read-only — no data is modified.",
     {
       city: z.string().describe("City slug (e.g. 'london', 'barcelona', 'dubai')"),
       capacity_min: z.number().optional().describe("Minimum guest capacity"),
@@ -44,27 +46,35 @@ export function registerTools(server: McpServer): void {
       limit: z.number().min(1).max(25).default(10).optional().describe("Max results (default 10, max 25)"),
     },
     async (params) => {
+      // Sanitize inputs
+      const city = sanitizeSlug(params.city, "city");
+      const capacityMin = sanitizeNumber(params.capacity_min, 1, 10000);
+      const capacityMax = sanitizeNumber(params.capacity_max, 1, 10000);
+      const eventType = params.event_type ? sanitizeEventType(params.event_type) : undefined;
+      const limit = sanitizeNumber(params.limit, 1, 25, 10);
+
       const result = await searchVenues({
-        city: params.city,
-        capacityMin: params.capacity_min,
-        capacityMax: params.capacity_max,
+        city,
+        capacityMin,
+        capacityMax,
         category: params.category,
-        eventType: params.event_type,
-        limit: params.limit,
+        eventType,
+        limit,
       });
 
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "search_venues",
-        city: params.city,
-        capacity: params.capacity_min,
-        eventType: params.event_type,
+        city,
+        capacity: capacityMin,
+        eventType,
         category: params.category,
         resultCount: result.venues.length,
       });
 
       const response = {
         results: result.venues.map((v) => ({
+          venue_uid: v.id,
           name: v.name,
           city: v.city,
           country: v.country,
@@ -81,6 +91,7 @@ export function registerTools(server: McpServer): void {
           description: v.description,
           image_url: v.imageUrl,
           url: v.url,
+          quote_url: v.quoteUrl,
         })),
         total_count: result.total,
         city_url: result.cityUrl,
@@ -94,7 +105,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ────────────────────────────────────────
-  // 2. get_city_info (P0)
+  // 2. get_city_info
   // ────────────────────────────────────────
   server.tool(
     "get_city_info",
@@ -103,27 +114,28 @@ export function registerTools(server: McpServer): void {
       city: z.string().describe("City slug (e.g. 'london', 'dubai', 'barcelona')"),
     },
     async (params) => {
-      const info = await getCityInfo(params.city);
+      const city = sanitizeSlug(params.city, "city");
+      const info = await getCityInfo(city);
 
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "get_city_info",
-        city: params.city,
+        city,
         resultCount: info.venueCount,
       });
 
       const response = {
-        city: info.city?.name || params.city,
+        city: info.city?.name || city,
         country: info.city?.country || "",
         continent: info.city?.continent || "",
         venue_count: info.venueCount,
         categories: info.categories.map((c) => ({
           name: c.name,
           count: c.count,
-          url: `${EVENTFLARE_URL}/venues/${params.city}/${c.slug}`,
+          url: `${EVENTFLARE_URL}/venues/${city}/${c.slug}`,
         })),
         price_range_per_hour: info.priceRange,
-        url: info.city?.url || `${EVENTFLARE_URL}/venues/${params.city}`,
+        url: info.city?.url || `${EVENTFLARE_URL}/venues/${city}`,
         source: "Eventflare — eventflare.io",
       };
 
@@ -134,7 +146,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ────────────────────────────────────────
-  // 3. list_cities (P1)
+  // 3. list_cities
   // ────────────────────────────────────────
   server.tool(
     "list_cities",
@@ -147,12 +159,13 @@ export function registerTools(server: McpServer): void {
         .describe("Filter by region (default: all)"),
     },
     async (params) => {
-      const cities = await listCities(params.region);
+      const region = sanitizeRegion(params.region);
+      const cities = await listCities(region);
 
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "list_cities",
-        region: params.region,
+        region,
         resultCount: cities.length,
       });
 
@@ -174,7 +187,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ────────────────────────────────────────
-  // 4. get_venue_details (P1)
+  // 4. get_venue_details
   // ────────────────────────────────────────
   server.tool(
     "get_venue_details",
@@ -184,30 +197,31 @@ export function registerTools(server: McpServer): void {
       city: z.string().describe("City slug the venue is in"),
     },
     async (params) => {
-      const venue = await getVenueDetails(params.city, params.venue_slug);
+      const city = sanitizeSlug(params.city, "city");
+      const venueSlug = sanitizeSlug(params.venue_slug, "venue_slug");
+      const venue = await getVenueDetails(city, venueSlug);
 
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "get_venue_details",
-        city: params.city,
+        city,
         resultCount: venue ? 1 : 0,
       });
 
       if (!venue) {
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                error: "Venue not found",
-                suggestion: `Try searching with search_venues tool for city "${params.city}"`,
-              }),
-            },
-          ],
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              error: "Venue not found",
+              suggestion: `Try searching with search_venues tool for city "${city}"`,
+            }),
+          }],
         };
       }
 
       const response = {
+        venue_uid: venue.id,
         name: venue.name,
         city: venue.city,
         country: venue.country,
@@ -231,7 +245,7 @@ export function registerTools(server: McpServer): void {
         ratings_count: venue.ratingsCount,
         image_url: venue.imageUrl,
         url: venue.url,
-        book_url: `${venue.url}#inquiry`,
+        quote_url: venue.quoteUrl,
         source: "Eventflare — eventflare.io",
       };
 
@@ -242,7 +256,7 @@ export function registerTools(server: McpServer): void {
   );
 
   // ────────────────────────────────────────
-  // 5. get_pricing_guide (P2)
+  // 5. get_pricing_guide
   // ────────────────────────────────────────
   server.tool(
     "get_pricing_guide",
@@ -250,20 +264,23 @@ export function registerTools(server: McpServer): void {
     {
       city: z.string().describe("City slug"),
       event_type: z.string().optional().describe("Event type for context"),
-      capacity: z.number().optional().describe("Expected guest count — filters to venues that fit"),
+      capacity: z.number().optional().describe("Expected guest count"),
     },
     async (params) => {
+      const city = sanitizeSlug(params.city, "city");
+      const capacity = sanitizeNumber(params.capacity, 1, 10000);
+
       const pricing = await getPricingGuide({
-        city: params.city,
-        eventType: params.event_type,
-        capacity: params.capacity,
+        city,
+        eventType: params.event_type ? sanitizeEventType(params.event_type) : undefined,
+        capacity,
       });
 
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "get_pricing_guide",
-        city: params.city,
-        capacity: params.capacity,
+        city,
+        capacity,
         eventType: params.event_type,
       });
 
@@ -274,8 +291,8 @@ export function registerTools(server: McpServer): void {
         price_per_day: pricing.pricePerDay,
         currency: pricing.currency,
         by_category: pricing.byCategory,
-        note: "Prices are indicative based on listed venues. Contact venues directly for exact quotes.",
-        browse_url: `${EVENTFLARE_URL}/venues/${params.city}`,
+        note: "Prices are indicative. Contact venues directly for exact quotes.",
+        browse_url: `${EVENTFLARE_URL}/venues/${city}`,
         source: "Eventflare — eventflare.io",
       };
 
@@ -286,11 +303,11 @@ export function registerTools(server: McpServer): void {
   );
 
   // ────────────────────────────────────────
-  // 6. request_quote (P2)
+  // 6. request_quote
   // ────────────────────────────────────────
   server.tool(
     "request_quote",
-    "Generate a URL for the user to request a venue quote on Eventflare. Does not submit any data — returns a link the user can visit to complete their inquiry.",
+    "Generate a URL for the user to request a venue quote on Eventflare. Does not submit any data — returns a link the user visits to complete their inquiry.",
     {
       city: z.string().describe("City slug"),
       event_type: z.string().optional().describe("Type of event"),
@@ -299,34 +316,35 @@ export function registerTools(server: McpServer): void {
       venue_slug: z.string().optional().describe("Specific venue slug (if known)"),
     },
     async (params) => {
+      const city = sanitizeSlug(params.city, "city");
+      const capacity = sanitizeNumber(params.capacity, 1, 10000);
+      const date = sanitizeDate(params.date);
+
       logQuery({
         timestamp: new Date().toISOString(),
         tool: "request_quote",
-        city: params.city,
-        capacity: params.capacity,
+        city,
+        capacity,
         eventType: params.event_type,
       });
 
-      // Build inquiry URL
       let inquiryUrl: string;
 
       if (params.venue_slug) {
-        // Specific venue
-        inquiryUrl = `${EVENTFLARE_URL}/spaces/${params.city}/${params.venue_slug}#inquiry`;
+        const venueSlug = sanitizeSlug(params.venue_slug, "venue_slug");
+        inquiryUrl = `${EVENTFLARE_URL}/spaces/${city}/${venueSlug}#inquiry`;
       } else {
-        // City browse with filters
         const urlParams = new URLSearchParams();
-        if (params.event_type) urlParams.set("type", params.event_type);
-        if (params.capacity) urlParams.set("capacity", String(params.capacity));
-        if (params.date) urlParams.set("date", params.date);
+        if (params.event_type) urlParams.set("type", sanitizeEventType(params.event_type));
+        if (capacity) urlParams.set("capacity", String(capacity));
+        if (date) urlParams.set("date", date);
         const qs = urlParams.toString();
-        inquiryUrl = `${EVENTFLARE_URL}/venues/${params.city}${qs ? `?${qs}` : ""}`;
+        inquiryUrl = `${EVENTFLARE_URL}/venues/${city}${qs ? `?${qs}` : ""}`;
       }
 
       const response = {
         inquiry_url: inquiryUrl,
-        message:
-          "Visit this link to browse venues and submit your inquiry on Eventflare. A local event expert will respond within 24 hours.",
+        message: "Visit this link to browse venues and submit your inquiry. A local event expert will respond within 24 hours.",
         source: "Eventflare — eventflare.io",
       };
 

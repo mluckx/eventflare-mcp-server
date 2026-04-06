@@ -1,8 +1,11 @@
 /**
  * Strapi API client for Eventflare venue data.
  * Calls dev-content.eventflare.io/api directly — no auth required for GET.
+ * READ-ONLY: Only GET requests. No writes, no deletes.
  * When migrating off Strapi, swap STRAPI_API_URL and update response mapping.
  */
+
+import { cacheGet, cacheSet, cacheKey } from "./cache.js";
 
 const STRAPI_API_URL = process.env.STRAPI_API_URL || "https://dev-content.eventflare.io/api";
 const EVENTFLARE_URL = process.env.EVENTFLARE_URL || "https://eventflare.io";
@@ -10,6 +13,7 @@ const EVENTFLARE_URL = process.env.EVENTFLARE_URL || "https://eventflare.io";
 // ---------- Types ----------
 
 export interface VenueSummary {
+  id: number;                    // Venue UID — stable reference for Eventflare tracking
   name: string;
   slug: string;
   city: string;
@@ -36,6 +40,7 @@ export interface VenueSummary {
   description: string;
   imageUrl: string | null;
   url: string;
+  quoteUrl: string;              // Direct quote request link
 }
 
 export interface CityInfo {
@@ -49,16 +54,11 @@ export interface CityInfo {
   url: string;
 }
 
-export interface PaginationMeta {
-  total: number;
-  start: number;
-  limit: number;
-}
-
 // ---------- Field Mapping ----------
 
 function mapVenue(item: any): VenueSummary {
   const a = item.attributes || item;
+  const venueId = item.id || 0;
 
   // Region (city) — first region
   const region = a.regions?.data?.[0]?.attributes || {};
@@ -106,7 +106,10 @@ function mapVenue(item: any): VenueSummary {
     ? a.mainFeatures.split(",").map((f: string) => f.trim()).filter(Boolean)
     : [];
 
+  const venueUrl = `${EVENTFLARE_URL}/spaces/${citySlug}/${a.slug}`;
+
   return {
+    id: venueId,
     name: a.title || "",
     slug: a.slug || "",
     city: cityName,
@@ -135,7 +138,8 @@ function mapVenue(item: any): VenueSummary {
     isFeatured: a.isFeatured || false,
     description,
     imageUrl,
-    url: `${EVENTFLARE_URL}/spaces/${citySlug}/${a.slug}`,
+    url: venueUrl,
+    quoteUrl: `${venueUrl}#inquiry`,
   };
 }
 
@@ -153,7 +157,7 @@ function mapCity(item: any): CityInfo {
   };
 }
 
-// ---------- API Calls ----------
+// ---------- API Calls (READ-ONLY) ----------
 
 async function strapiGet(path: string, params: Record<string, string> = {}): Promise<any> {
   const url = new URL(`${STRAPI_API_URL}${path}`);
@@ -161,15 +165,31 @@ async function strapiGet(path: string, params: Record<string, string> = {}): Pro
     url.searchParams.set(k, v);
   }
 
-  const res = await fetch(url.toString(), {
-    headers: { "Accept": "application/json" },
-  });
+  // Check cache first
+  const ck = cacheKey("strapi", { path, ...params });
+  const cached = cacheGet<any>(ck);
+  if (cached) return cached;
 
-  if (!res.ok) {
-    throw new Error(`Strapi API error: ${res.status} ${res.statusText} — ${url.pathname}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+
+  try {
+    const res = await fetch(url.toString(), {
+      method: "GET", // READ-ONLY — never POST/PUT/DELETE
+      headers: { "Accept": "application/json" },
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      throw new Error(`Strapi API error: ${res.status} ${res.statusText} — ${url.pathname}`);
+    }
+
+    const data = await res.json();
+    cacheSet(ck, data); // Cache for 5 minutes
+    return data;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return res.json();
 }
 
 /**
@@ -189,25 +209,18 @@ export async function searchVenues(opts: {
     "sort": "popularity:desc",
   };
 
-  // City filter — match region URL slug
   if (opts.city) {
     params["filters[regions][url][$eq]"] = opts.city.toLowerCase();
   }
-
-  // Capacity filter
   if (opts.capacityMin) {
     params["filters[highestSetupCapacity][$gte]"] = String(opts.capacityMin);
   }
   if (opts.capacityMax) {
     params["filters[lowestSetupCapacity][$lte]"] = String(opts.capacityMax);
   }
-
-  // Category filter — match category slug
   if (opts.category) {
     params["filters[categories][slug][$eq]"] = opts.category;
   }
-
-  // Event type — match activity slug
   if (opts.eventType) {
     params["filters[activities][slug][$containsi]"] = opts.eventType;
   }
@@ -241,7 +254,7 @@ export async function getVenueDetails(city: string, venueSlug: string): Promise<
 }
 
 /**
- * List all cities (regions) with venue counts.
+ * List all cities (regions).
  */
 export async function listCities(region?: string): Promise<CityInfo[]> {
   const params: Record<string, string> = {
@@ -266,7 +279,6 @@ export async function getCityInfo(citySlug: string): Promise<{
   categories: { name: string; slug: string; count: number }[];
   priceRange: { min: number; max: number; currency: string };
 }> {
-  // Get city details
   const cityData = await strapiGet("/regions", {
     "filters[url][$eq]": citySlug.toLowerCase(),
     "pagination[limit]": "1",
@@ -274,7 +286,6 @@ export async function getCityInfo(citySlug: string): Promise<{
 
   const city = cityData.data?.[0] ? mapCity(cityData.data[0]) : null;
 
-  // Get venue count and sample for stats
   const venueData = await strapiGet("/spaces", {
     "filters[regions][url][$eq]": citySlug.toLowerCase(),
     "populate": "categories",
@@ -284,27 +295,20 @@ export async function getCityInfo(citySlug: string): Promise<{
 
   const total = venueData.meta?.pagination?.total || 0;
 
-  // Aggregate categories from sample
   const catCounts = new Map<string, { name: string; slug: string; count: number }>();
   for (const space of venueData.data || []) {
     for (const cat of space.attributes?.categories?.data || []) {
       const slug = cat.attributes?.slug || "";
       const name = cat.attributes?.name || "";
       const existing = catCounts.get(slug);
-      if (existing) {
-        existing.count++;
-      } else {
-        catCounts.set(slug, { name, slug, count: 1 });
-      }
+      if (existing) existing.count++;
+      else catCounts.set(slug, { name, slug, count: 1 });
     }
   }
 
-  // Get price range from sample
   const prices = (venueData.data || [])
     .map((s: any) => s.attributes?.priceCalculatedPerHour)
     .filter((p: any) => p && p > 0);
-
-  const currency = city?.currency || "€";
 
   return {
     city,
@@ -313,7 +317,7 @@ export async function getCityInfo(citySlug: string): Promise<{
     priceRange: {
       min: prices.length ? Math.min(...prices) : 0,
       max: prices.length ? Math.max(...prices) : 0,
-      currency,
+      currency: city?.currency || "€",
     },
   };
 }
@@ -357,7 +361,6 @@ export async function getPricingGuide(opts: {
 
   const avg = (arr: number[]) => arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
 
-  // By category
   const catPrices = new Map<string, number[]>();
   for (const s of spaces) {
     const price = s.attributes?.priceCalculatedPerHour;
@@ -370,7 +373,6 @@ export async function getPricingGuide(opts: {
   }
 
   const regionAttrs = spaces[0]?.attributes?.regions?.data?.[0]?.attributes;
-  const currency = regionAttrs?.currencyType || "€";
 
   return {
     city: opts.city,
@@ -385,7 +387,7 @@ export async function getPricingGuide(opts: {
       avg: avg(dayPrices),
       max: dayPrices.length ? Math.max(...dayPrices) : 0,
     },
-    currency,
+    currency: regionAttrs?.currencyType || "€",
     byCategory: [...catPrices.entries()]
       .map(([category, prices]) => ({
         category,

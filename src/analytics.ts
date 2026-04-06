@@ -1,13 +1,27 @@
 /**
- * Anonymized query analytics logger + API.
- * Logs every MCP tool call — no PII, just query patterns.
- * Output: JSONL file (one JSON object per line).
+ * Analytics logger and summary generator.
+ * Logs every MCP tool call to a JSONL file for dashboard reporting.
+ * No PII is logged — only tool name, city, capacity, event type, category, result count.
  */
 
-import { appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { writeFileSync, appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 
-const LOG_PATH = process.env.ANALYTICS_LOG || "./analytics.jsonl";
+const LOG_DIR = process.env.LOG_DIR || join(process.cwd(), "logs");
+const LOG_FILE = join(LOG_DIR, "queries.jsonl");
+
+// Ensure log directory exists
+try {
+  if (!existsSync(LOG_DIR)) {
+    mkdirSync(LOG_DIR, { recursive: true });
+  }
+} catch {
+  // If we can't create log dir, we'll log to memory only
+}
+
+// In-memory buffer for recent queries (last 1000)
+const recentQueries: QueryLog[] = [];
+const MAX_MEMORY = 1000;
 
 export interface QueryLog {
   timestamp: string;
@@ -20,51 +34,76 @@ export interface QueryLog {
   resultCount?: number;
 }
 
+/**
+ * Log a query to both file and memory.
+ */
 export function logQuery(entry: QueryLog): void {
+  // Add to memory buffer
+  recentQueries.push(entry);
+  if (recentQueries.length > MAX_MEMORY) {
+    recentQueries.shift();
+  }
+
+  // Append to JSONL file
   try {
-    const dir = dirname(LOG_PATH);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-
-    const line = JSON.stringify({
-      ...entry,
-      timestamp: entry.timestamp || new Date().toISOString(),
-    });
-
-    appendFileSync(LOG_PATH, line + "\n");
+    appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
   } catch {
-    // Analytics should never crash the server
+    // Silently fail if file write fails (e.g., read-only filesystem)
   }
 }
 
 /**
- * Read all logged queries.
+ * Read all queries from file + memory.
  */
 export function readAllQueries(): QueryLog[] {
+  const fromFile: QueryLog[] = [];
+
   try {
-    if (!existsSync(LOG_PATH)) return [];
-    const content = readFileSync(LOG_PATH, "utf-8").trim();
-    if (!content) return [];
-    return content.split("\n").map((line) => JSON.parse(line));
+    if (existsSync(LOG_FILE)) {
+      const content = readFileSync(LOG_FILE, "utf-8");
+      for (const line of content.split("\n")) {
+        if (line.trim()) {
+          try {
+            fromFile.push(JSON.parse(line));
+          } catch {
+            // Skip malformed lines
+          }
+        }
+      }
+    }
   } catch {
-    return [];
+    // Fall back to memory only
   }
+
+  // Deduplicate: use file data if available, otherwise memory
+  return fromFile.length > 0 ? fromFile : recentQueries;
 }
 
 /**
- * Compute analytics summary from logged queries.
+ * Generate analytics summary for dashboard.
  */
-export function getAnalyticsSummary() {
+export function getAnalyticsSummary(): {
+  total: number;
+  last24h: number;
+  last7d: number;
+  last30d: number;
+  byTool: Record<string, number>;
+  topCities: { city: string; count: number }[];
+  topEventTypes: { eventType: string; count: number }[];
+  topCategories: { category: string; count: number }[];
+  capacityDistribution: { range: string; count: number }[];
+  dailyTimeline: { date: string; count: number }[];
+  hourlyDistribution: { hour: number; count: number }[];
+  recentQueries: QueryLog[];
+} {
   const queries = readAllQueries();
-  const now = new Date();
-  const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-  const last30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const now = Date.now();
+  const day = 24 * 60 * 60 * 1000;
 
-  // Totals by period
-  const total = queries.length;
-  const last24hCount = queries.filter((q) => new Date(q.timestamp) >= last24h).length;
-  const last7dCount = queries.filter((q) => new Date(q.timestamp) >= last7d).length;
-  const last30dCount = queries.filter((q) => new Date(q.timestamp) >= last30d).length;
+  // Time-based counts
+  const last24h = queries.filter((q) => now - new Date(q.timestamp).getTime() < day).length;
+  const last7d = queries.filter((q) => now - new Date(q.timestamp).getTime() < 7 * day).length;
+  const last30d = queries.filter((q) => now - new Date(q.timestamp).getTime() < 30 * day).length;
 
   // By tool
   const byTool: Record<string, number> = {};
@@ -72,75 +111,88 @@ export function getAnalyticsSummary() {
     byTool[q.tool] = (byTool[q.tool] || 0) + 1;
   }
 
-  // By city (top 20)
-  const byCity: Record<string, number> = {};
+  // Top cities
+  const cityCounts = new Map<string, number>();
   for (const q of queries) {
-    if (q.city) byCity[q.city] = (byCity[q.city] || 0) + 1;
+    if (q.city) cityCounts.set(q.city, (cityCounts.get(q.city) || 0) + 1);
   }
-  const topCities = Object.entries(byCity)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([city, count]) => ({ city, count }));
+  const topCities = [...cityCounts.entries()]
+    .map(([city, count]) => ({ city, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 15);
 
-  // By event type (top 20)
-  const byEventType: Record<string, number> = {};
+  // Top event types
+  const eventCounts = new Map<string, number>();
   for (const q of queries) {
-    if (q.eventType) byEventType[q.eventType] = (byEventType[q.eventType] || 0) + 1;
+    if (q.eventType) eventCounts.set(q.eventType, (eventCounts.get(q.eventType) || 0) + 1);
   }
-  const topEventTypes = Object.entries(byEventType)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([eventType, count]) => ({ eventType, count }));
+  const topEventTypes = [...eventCounts.entries()]
+    .map(([eventType, count]) => ({ eventType, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
 
-  // By category (top 10)
-  const byCategory: Record<string, number> = {};
+  // Top categories
+  const catCounts = new Map<string, number>();
   for (const q of queries) {
-    if (q.category) byCategory[q.category] = (byCategory[q.category] || 0) + 1;
+    if (q.category) catCounts.set(q.category, (catCounts.get(q.category) || 0) + 1);
   }
-  const topCategories = Object.entries(byCategory)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10)
-    .map(([category, count]) => ({ category, count }));
+  const topCategories = [...catCounts.entries()]
+    .map(([category, count]) => ({ category, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
 
   // Capacity distribution
-  const capacityBuckets = { "1-10": 0, "11-50": 0, "51-100": 0, "101-250": 0, "251-500": 0, "500+": 0 };
+  const capacityBuckets = [
+    { range: "1-10", min: 1, max: 10, count: 0 },
+    { range: "11-30", min: 11, max: 30, count: 0 },
+    { range: "31-50", min: 31, max: 50, count: 0 },
+    { range: "51-100", min: 51, max: 100, count: 0 },
+    { range: "101-200", min: 101, max: 200, count: 0 },
+    { range: "201-500", min: 201, max: 500, count: 0 },
+    { range: "500+", min: 501, max: 99999, count: 0 },
+  ];
   for (const q of queries) {
-    if (!q.capacity) continue;
-    if (q.capacity <= 10) capacityBuckets["1-10"]++;
-    else if (q.capacity <= 50) capacityBuckets["11-50"]++;
-    else if (q.capacity <= 100) capacityBuckets["51-100"]++;
-    else if (q.capacity <= 250) capacityBuckets["101-250"]++;
-    else if (q.capacity <= 500) capacityBuckets["251-500"]++;
-    else capacityBuckets["500+"]++;
+    if (q.capacity) {
+      for (const bucket of capacityBuckets) {
+        if (q.capacity >= bucket.min && q.capacity <= bucket.max) {
+          bucket.count++;
+          break;
+        }
+      }
+    }
   }
 
-  // Timeline — queries per day (last 30 days)
-  const dailyCounts: Record<string, number> = {};
+  // Daily timeline (last 30 days)
+  const dailyCounts = new Map<string, number>();
   for (const q of queries) {
-    const day = q.timestamp.split("T")[0];
-    dailyCounts[day] = (dailyCounts[day] || 0) + 1;
+    const date = q.timestamp.split("T")[0];
+    if (date) dailyCounts.set(date, (dailyCounts.get(date) || 0) + 1);
   }
-  const timeline = Object.entries(dailyCounts)
-    .sort((a, b) => a[0].localeCompare(b[0]))
-    .slice(-30)
-    .map(([date, count]) => ({ date, count }));
+  const dailyTimeline = [...dailyCounts.entries()]
+    .map(([date, count]) => ({ date, count }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(-30);
 
   // Hourly distribution
-  const hourly = new Array(24).fill(0);
+  const hourlyCounts = new Array(24).fill(0);
   for (const q of queries) {
     const hour = new Date(q.timestamp).getHours();
-    hourly[hour]++;
+    if (!isNaN(hour)) hourlyCounts[hour]++;
   }
+  const hourlyDistribution = hourlyCounts.map((count, hour) => ({ hour, count }));
 
   return {
-    overview: { total, last24h: last24hCount, last7d: last7dCount, last30d: last30dCount },
+    total: queries.length,
+    last24h,
+    last7d,
+    last30d,
     byTool,
     topCities,
     topEventTypes,
     topCategories,
-    capacityBuckets,
-    timeline,
-    hourly,
-    recentQueries: queries.slice(-50).reverse(),
+    capacityDistribution: capacityBuckets.map(({ range, count }) => ({ range, count })),
+    dailyTimeline,
+    hourlyDistribution,
+    recentQueries: queries.slice(-20).reverse(),
   };
 }
