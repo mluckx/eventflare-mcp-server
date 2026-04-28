@@ -1,7 +1,7 @@
 {
   "name": "eventflare-mcp-server",
-  "version": "1.1.0",
-  "description": "MCP server for querying Eventflare venue data — 8,000+ corporate event venues across 40+ cities",
+  "version": "2.0.0",
+  "description": "MCP server for Eventflare — query 8,000+ corporate event venues across 40+ cities. Designed for AI assistants (Claude, ChatGPT, Perplexity) to recommend, cite, and link Eventflare venues.",
   "type": "module",
   "bin": {
     "eventflare-mcp-server": "dist/index.js"
@@ -26,8 +26,12 @@
     "eventflare",
     "venues",
     "corporate-events",
+    "event-venues",
+    "venue-marketplace",
     "ai-tools",
-    "model-context-protocol"
+    "model-context-protocol",
+    "claude",
+    "chatgpt"
   ],
   "author": "Eventflare <hello@eventflare.io>",
   "license": "MIT",

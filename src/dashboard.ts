@@ -1,10 +1,16 @@
 /**
  * Self-contained HTML dashboard for MCP analytics.
  * Served at /dashboard — no external dependencies.
- * Dark theme, auto-refreshes every 30 seconds.
+ * Auto-refreshes every 30 seconds.
+ *
+ * v2 changes:
+ *   - Accepts version param (rendered in subtitle)
+ *   - Renders byClient breakdown (Claude / ChatGPT / Perplexity / etc.)
+ *   - Renders budgetBands, clickThroughRate
+ *   - Fixed type cast in tool-sort comparator (was TS-syntax-in-JS bug)
  */
 
-export function getDashboardHtml(): string {
+export function getDashboardHtml(version: string = "2.0.0"): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -33,14 +39,12 @@ export function getDashboardHtml(): string {
   .bar-count { width: 40px; text-align: right; font-size: 13px; color: #64748b; flex-shrink: 0; }
   .heatmap { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; }
   .heat-cell { aspect-ratio: 1; border-radius: 3px; position: relative; }
-  .heat-cell:hover::after { content: attr(title); position: absolute; bottom: 110%; left: 50%; transform: translateX(-50%); background: #1e293b; color: #f8fafc; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; border: 1px solid #475569; z-index: 10; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th { text-align: left; padding: 8px 12px; color: #64748b; border-bottom: 1px solid #334155; font-weight: 500; }
   td { padding: 8px 12px; border-bottom: 1px solid #1e293b; color: #cbd5e1; }
   tr:hover td { background: #1e293b; }
   .timeline { display: flex; align-items: flex-end; gap: 2px; height: 80px; }
   .timeline-bar { flex: 1; background: #3b82f6; border-radius: 2px 2px 0 0; min-height: 2px; position: relative; }
-  .timeline-bar:hover::after { content: attr(title); position: absolute; bottom: 110%; left: 50%; transform: translateX(-50%); background: #1e293b; color: #f8fafc; padding: 4px 8px; border-radius: 4px; font-size: 11px; white-space: nowrap; border: 1px solid #475569; z-index: 10; }
   .loading { text-align: center; padding: 40px; color: #64748b; }
   .refresh-note { text-align: center; font-size: 11px; color: #475569; margin-top: 16px; }
   .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
@@ -49,7 +53,7 @@ export function getDashboardHtml(): string {
 </head>
 <body>
 <h1>Eventflare MCP Dashboard</h1>
-<p class="subtitle">Real-time analytics for AI venue queries &mdash; v1.1.0</p>
+<p class="subtitle">Real-time analytics for AI venue queries — v${version}</p>
 <div id="app"><div class="loading">Loading analytics...</div></div>
 <p class="refresh-note">Auto-refreshes every 30 seconds</p>
 
@@ -71,16 +75,16 @@ async function load() {
 function render(d) {
   const uniqueCities = d.topCities ? d.topCities.length : 0;
   const tools = d.byTool || {};
+  const clients = d.byClient || {};
 
-  // Stat cards
   let html = '<div class="grid">';
   html += statCard('Total Queries', d.total, 'All time');
   html += statCard('Last 24h', d.last24h, 'Today');
   html += statCard('Last 7 Days', d.last7d, 'This week');
   html += statCard('Cities Queried', uniqueCities, 'Unique cities');
+  html += statCard('Click-through Rate', (d.clickThroughRate || 0) + '%', 'search → detail/quote');
   html += '</div>';
 
-  // Daily timeline
   if (d.dailyTimeline && d.dailyTimeline.length > 0) {
     const maxDay = Math.max(...d.dailyTimeline.map(t => t.count), 1);
     html += '<div class="section"><div class="section-title">Daily Timeline</div><div class="timeline">';
@@ -91,14 +95,20 @@ function render(d) {
     html += '</div></div>';
   }
 
-  // Tool breakdown
   html += '<div class="section"><div class="section-title">Queries by Tool</div><div class="pills">';
-  for (const [tool, count] of Object.entries(tools).sort((a, b) => (b[1] as number) - (a[1] as number))) {
+  for (const [tool, count] of Object.entries(tools).sort((a, b) => b[1] - a[1])) {
     html += '<div class="pill">' + tool + '<span>' + count + '</span></div>';
   }
   html += '</div></div>';
 
-  // Hourly heatmap
+  if (Object.keys(clients).length > 0) {
+    html += '<div class="section"><div class="section-title">Queries by Client</div><div class="pills">';
+    for (const [client, count] of Object.entries(clients).sort((a, b) => b[1] - a[1])) {
+      html += '<div class="pill">' + client + '<span>' + count + '</span></div>';
+    }
+    html += '</div></div>';
+  }
+
   if (d.hourlyDistribution) {
     const maxH = Math.max(...d.hourlyDistribution.map(h => h.count), 1);
     html += '<div class="section"><div class="section-title">Queries by Hour (UTC)</div><div class="heatmap">';
@@ -110,10 +120,7 @@ function render(d) {
     html += '</div></div>';
   }
 
-  // Two column: cities + event types
   html += '<div class="two-col">';
-
-  // Top cities
   if (d.topCities && d.topCities.length > 0) {
     const maxC = d.topCities[0].count;
     html += '<div class="section"><div class="section-title">Top Cities</div>';
@@ -122,8 +129,6 @@ function render(d) {
     }
     html += '</div>';
   }
-
-  // Top event types
   if (d.topEventTypes && d.topEventTypes.length > 0) {
     const maxE = d.topEventTypes[0].count;
     html += '<div class="section"><div class="section-title">Top Event Types</div>';
@@ -134,10 +139,17 @@ function render(d) {
   } else {
     html += '<div class="section"><div class="section-title">Top Event Types</div><div style="color:#64748b;font-size:13px">No event type data yet</div></div>';
   }
-
   html += '</div>';
 
-  // Capacity distribution
+  if (d.budgetBands && d.budgetBands.length > 0) {
+    const maxB = d.budgetBands[0].count;
+    html += '<div class="section"><div class="section-title">Budget Bands (by capacity)</div>';
+    for (const b of d.budgetBands) {
+      html += barRow(b.band, b.count, maxB);
+    }
+    html += '</div>';
+  }
+
   if (d.capacityDistribution) {
     const maxCap = Math.max(...d.capacityDistribution.map(b => b.count), 1);
     html += '<div class="section"><div class="section-title">Capacity Distribution</div>';
@@ -147,13 +159,12 @@ function render(d) {
     html += '</div>';
   }
 
-  // Recent queries table
   if (d.recentQueries && d.recentQueries.length > 0) {
     html += '<div class="section"><div class="section-title">Recent Queries</div>';
-    html += '<table><thead><tr><th>Time</th><th>Tool</th><th>City</th><th>Capacity</th><th>Event Type</th><th>Results</th></tr></thead><tbody>';
+    html += '<table><thead><tr><th>Time</th><th>Tool</th><th>Client</th><th>City</th><th>Capacity</th><th>Event</th><th>Results</th></tr></thead><tbody>';
     for (const q of d.recentQueries) {
       const time = new Date(q.timestamp).toLocaleString();
-      html += '<tr><td>' + time + '</td><td>' + (q.tool || '') + '</td><td>' + (q.city || '-') + '</td><td>' + (q.capacity || '-') + '</td><td>' + (q.eventType || '-') + '</td><td>' + (q.resultCount ?? '-') + '</td></tr>';
+      html += '<tr><td>' + time + '</td><td>' + (q.tool || '') + '</td><td>' + (q.clientClass || '-') + '</td><td>' + (q.city || '-') + '</td><td>' + (q.capacity || '-') + '</td><td>' + (q.eventType || '-') + '</td><td>' + (q.resultCount ?? '-') + '</td></tr>';
     }
     html += '</tbody></table></div>';
   }

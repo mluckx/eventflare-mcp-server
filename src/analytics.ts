@@ -1,27 +1,42 @@
 /**
  * Analytics logger and summary generator.
- * Logs every MCP tool call to a JSONL file for dashboard reporting.
- * No PII is logged — only tool name, city, capacity, event type, category, result count.
+ *
+ * v2 changes:
+ *   - Added: mcp_session_id, client_class, query_hour_utc, budget_band, language
+ *   - Added: result_clicked_through tracking (does a follow-up reference a search result?)
+ *   - Mirrors every event to remote sink via analytics-sink.ts (OpenPanel etc.) — fire and forget
+ *   - All fields strictly non-PII. No user identity, no message content.
  */
 
 import { writeFileSync, appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
+import { sendToSink } from "./analytics-sink.js";
 
 const LOG_DIR = process.env.LOG_DIR || join(process.cwd(), "logs");
 const LOG_FILE = join(LOG_DIR, "queries.jsonl");
 
-// Ensure log directory exists
 try {
-  if (!existsSync(LOG_DIR)) {
-    mkdirSync(LOG_DIR, { recursive: true });
-  }
-} catch {
-  // If we can't create log dir, we'll log to memory only
-}
+  if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true });
+} catch {}
 
-// In-memory buffer for recent queries (last 1000)
 const recentQueries: QueryLog[] = [];
 const MAX_MEMORY = 1000;
+
+// Track which venues were returned in a session so we can detect click-through
+// when a follow-up tool call references one of them.
+const sessionVenueIds = new Map<string, Set<number>>();
+const SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
+const sessionLastSeen = new Map<string, number>();
+
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [sid, ts] of sessionLastSeen) {
+    if (ts < cutoff) {
+      sessionVenueIds.delete(sid);
+      sessionLastSeen.delete(sid);
+    }
+  }
+}, 5 * 60 * 1000);
 
 export interface QueryLog {
   timestamp: string;
@@ -32,32 +47,69 @@ export interface QueryLog {
   category?: string;
   region?: string;
   resultCount?: number;
+  // v2 additions
+  sessionId?: string;
+  clientClass?: string; // "claude_desktop" | "chatgpt" | "perplexity" | ...
+  queryHourUtc?: number;
+  budgetBand?: string; // "low" | "mid" | "high" — derived
+  language?: string;
+  resultClickedThrough?: boolean; // for get_venue_details / request_quote follow-ups
+  landmarkSlug?: string;
+  neighborhood?: string;
+  activitySlug?: string;
+  venueId?: number; // for detail / quote calls
 }
 
 /**
- * Log a query to both file and memory.
+ * Record venue IDs returned by a search so we can detect click-through later.
  */
+export function trackSearchResults(sessionId: string | undefined, venueIds: number[]): void {
+  if (!sessionId) return;
+  const set = sessionVenueIds.get(sessionId) || new Set();
+  for (const id of venueIds) set.add(id);
+  sessionVenueIds.set(sessionId, set);
+  sessionLastSeen.set(sessionId, Date.now());
+}
+
+/**
+ * Returns true if this venue was previously surfaced in this MCP session
+ * (and thus the current call is a click-through from a search result).
+ */
+export function wasSearchResult(sessionId: string | undefined, venueId: number): boolean {
+  if (!sessionId) return false;
+  return sessionVenueIds.get(sessionId)?.has(venueId) || false;
+}
+
+/** Coarse budget band from capacity hint (rough — refine with city-specific pricing later). */
+export function deriveBudgetBand(capacity?: number): string | undefined {
+  if (!capacity) return undefined;
+  if (capacity <= 20) return "intimate"; // 1-20
+  if (capacity <= 75) return "small"; // 21-75
+  if (capacity <= 200) return "mid"; // 76-200
+  if (capacity <= 500) return "large"; // 201-500
+  return "xlarge"; // 500+
+}
+
 export function logQuery(entry: QueryLog): void {
-  // Add to memory buffer
-  recentQueries.push(entry);
-  if (recentQueries.length > MAX_MEMORY) {
-    recentQueries.shift();
-  }
+  const enriched: QueryLog = {
+    ...entry,
+    queryHourUtc: new Date(entry.timestamp).getUTCHours(),
+    budgetBand: entry.budgetBand || deriveBudgetBand(entry.capacity),
+  };
 
-  // Append to JSONL file
+  recentQueries.push(enriched);
+  if (recentQueries.length > MAX_MEMORY) recentQueries.shift();
+
   try {
-    appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
-  } catch {
-    // Silently fail if file write fails (e.g., read-only filesystem)
-  }
+    appendFileSync(LOG_FILE, JSON.stringify(enriched) + "\n");
+  } catch {}
+
+  // Fire-and-forget remote sink. Never blocks. Never throws.
+  sendToSink(enriched).catch(() => {});
 }
 
-/**
- * Read all queries from file + memory.
- */
 export function readAllQueries(): QueryLog[] {
   const fromFile: QueryLog[] = [];
-
   try {
     if (existsSync(LOG_FILE)) {
       const content = readFileSync(LOG_FILE, "utf-8");
@@ -65,120 +117,105 @@ export function readAllQueries(): QueryLog[] {
         if (line.trim()) {
           try {
             fromFile.push(JSON.parse(line));
-          } catch {
-            // Skip malformed lines
-          }
+          } catch {}
         }
       }
     }
-  } catch {
-    // Fall back to memory only
-  }
-
-  // Deduplicate: use file data if available, otherwise memory
+  } catch {}
   return fromFile.length > 0 ? fromFile : recentQueries;
 }
 
-/**
- * Generate analytics summary for dashboard.
- */
 export function getAnalyticsSummary(): {
   total: number;
   last24h: number;
   last7d: number;
   last30d: number;
   byTool: Record<string, number>;
+  byClient: Record<string, number>;
   topCities: { city: string; count: number }[];
   topEventTypes: { eventType: string; count: number }[];
   topCategories: { category: string; count: number }[];
   capacityDistribution: { range: string; count: number }[];
+  budgetBands: { band: string; count: number }[];
   dailyTimeline: { date: string; count: number }[];
   hourlyDistribution: { hour: number; count: number }[];
+  clickThroughRate: number;
   recentQueries: QueryLog[];
 } {
   const queries = readAllQueries();
   const now = Date.now();
   const day = 24 * 60 * 60 * 1000;
 
-  // Time-based counts
   const last24h = queries.filter((q) => now - new Date(q.timestamp).getTime() < day).length;
   const last7d = queries.filter((q) => now - new Date(q.timestamp).getTime() < 7 * day).length;
   const last30d = queries.filter((q) => now - new Date(q.timestamp).getTime() < 30 * day).length;
 
-  // By tool
   const byTool: Record<string, number> = {};
+  const byClient: Record<string, number> = {};
+  const cityCounts = new Map<string, number>();
+  const eventCounts = new Map<string, number>();
+  const catCounts = new Map<string, number>();
+  const bandCounts = new Map<string, number>();
+  const dailyCounts = new Map<string, number>();
+  const hourlyCounts = new Array(24).fill(0);
+
+  let searches = 0;
+  let clickThroughs = 0;
+
   for (const q of queries) {
     byTool[q.tool] = (byTool[q.tool] || 0) + 1;
+    if (q.clientClass) byClient[q.clientClass] = (byClient[q.clientClass] || 0) + 1;
+    if (q.city) cityCounts.set(q.city, (cityCounts.get(q.city) || 0) + 1);
+    if (q.eventType) eventCounts.set(q.eventType, (eventCounts.get(q.eventType) || 0) + 1);
+    if (q.category) catCounts.set(q.category, (catCounts.get(q.category) || 0) + 1);
+    if (q.budgetBand) bandCounts.set(q.budgetBand, (bandCounts.get(q.budgetBand) || 0) + 1);
+
+    const date = q.timestamp.split("T")[0];
+    if (date) dailyCounts.set(date, (dailyCounts.get(date) || 0) + 1);
+    const hour = new Date(q.timestamp).getUTCHours();
+    if (!isNaN(hour)) hourlyCounts[hour]++;
+
+    if (q.tool === "search_venues") searches++;
+    if (q.resultClickedThrough) clickThroughs++;
   }
 
-  // Top cities
-  const cityCounts = new Map<string, number>();
-  for (const q of queries) {
-    if (q.city) cityCounts.set(q.city, (cityCounts.get(q.city) || 0) + 1);
-  }
   const topCities = [...cityCounts.entries()]
     .map(([city, count]) => ({ city, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 15);
-
-  // Top event types
-  const eventCounts = new Map<string, number>();
-  for (const q of queries) {
-    if (q.eventType) eventCounts.set(q.eventType, (eventCounts.get(q.eventType) || 0) + 1);
-  }
   const topEventTypes = [...eventCounts.entries()]
     .map(([eventType, count]) => ({ eventType, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
-
-  // Top categories
-  const catCounts = new Map<string, number>();
-  for (const q of queries) {
-    if (q.category) catCounts.set(q.category, (catCounts.get(q.category) || 0) + 1);
-  }
   const topCategories = [...catCounts.entries()]
     .map(([category, count]) => ({ category, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 10);
+  const budgetBands = [...bandCounts.entries()]
+    .map(([band, count]) => ({ band, count }))
+    .sort((a, b) => b.count - a.count);
 
-  // Capacity distribution
   const capacityBuckets = [
-    { range: "1-10", min: 1, max: 10, count: 0 },
-    { range: "11-30", min: 11, max: 30, count: 0 },
-    { range: "31-50", min: 31, max: 50, count: 0 },
-    { range: "51-100", min: 51, max: 100, count: 0 },
-    { range: "101-200", min: 101, max: 200, count: 0 },
+    { range: "1-20", min: 1, max: 20, count: 0 },
+    { range: "21-75", min: 21, max: 75, count: 0 },
+    { range: "76-200", min: 76, max: 200, count: 0 },
     { range: "201-500", min: 201, max: 500, count: 0 },
     { range: "500+", min: 501, max: 99999, count: 0 },
   ];
   for (const q of queries) {
-    if (q.capacity) {
-      for (const bucket of capacityBuckets) {
-        if (q.capacity >= bucket.min && q.capacity <= bucket.max) {
-          bucket.count++;
-          break;
-        }
+    if (!q.capacity) continue;
+    for (const b of capacityBuckets) {
+      if (q.capacity >= b.min && q.capacity <= b.max) {
+        b.count++;
+        break;
       }
     }
   }
 
-  // Daily timeline (last 30 days)
-  const dailyCounts = new Map<string, number>();
-  for (const q of queries) {
-    const date = q.timestamp.split("T")[0];
-    if (date) dailyCounts.set(date, (dailyCounts.get(date) || 0) + 1);
-  }
   const dailyTimeline = [...dailyCounts.entries()]
     .map(([date, count]) => ({ date, count }))
     .sort((a, b) => a.date.localeCompare(b.date))
     .slice(-30);
-
-  // Hourly distribution
-  const hourlyCounts = new Array(24).fill(0);
-  for (const q of queries) {
-    const hour = new Date(q.timestamp).getHours();
-    if (!isNaN(hour)) hourlyCounts[hour]++;
-  }
   const hourlyDistribution = hourlyCounts.map((count, hour) => ({ hour, count }));
 
   return {
@@ -187,12 +224,15 @@ export function getAnalyticsSummary(): {
     last7d,
     last30d,
     byTool,
+    byClient,
     topCities,
     topEventTypes,
     topCategories,
     capacityDistribution: capacityBuckets.map(({ range, count }) => ({ range, count })),
+    budgetBands,
     dailyTimeline,
     hourlyDistribution,
+    clickThroughRate: searches ? Math.round((clickThroughs / searches) * 1000) / 10 : 0,
     recentQueries: queries.slice(-20).reverse(),
   };
 }

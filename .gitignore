@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+logs/
+*.log
+test-mcp.mjs
+tsconfig.check.json
+.DS_Store
+*.tsbuildinfo
