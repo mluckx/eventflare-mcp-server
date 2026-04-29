@@ -146,13 +146,33 @@ if (transport === "http") {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
       if (req.method === "POST") {
+        // Read the raw body off the stream, then JSON.parse it.
+        // MCP SDK >= 1.12 expects handleRequest's third arg to be PARSED
+        // JSON, not a string. Passing a string yields a -32700 Parse error.
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk as Buffer);
-        const body = Buffer.concat(chunks).toString();
+        const raw = Buffer.concat(chunks).toString();
+
+        let parsedBody: unknown = undefined;
+        if (raw.length) {
+          try {
+            parsedBody = JSON.parse(raw);
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                error: { code: -32700, message: "Parse error: body is not valid JSON" },
+                id: null,
+              })
+            );
+            return;
+          }
+        }
 
         if (sessionId && transports.has(sessionId)) {
           const t = transports.get(sessionId)!;
-          await t.handleRequest(req, res, body);
+          await t.handleRequest(req, res, parsedBody);
         } else {
           const t = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
@@ -165,7 +185,7 @@ if (transport === "http") {
             if (id) transports.delete(id);
           };
           await server.connect(t);
-          await t.handleRequest(req, res, body);
+          await t.handleRequest(req, res, parsedBody);
         }
         return;
       }
