@@ -24,12 +24,19 @@ import { getCacheStats } from "./cache.js";
 
 const VERSION = "2.0.0";
 
+// For stdio mode only — HTTP mode creates a fresh server per session
 const server = new McpServer({
   name: "eventflare",
   version: VERSION,
 });
 
 registerTools(server);
+
+function createServer() {
+  const s = new McpServer({ name: "eventflare", version: VERSION });
+  registerTools(s);
+  return s;
+}
 
 const transport = process.env.TRANSPORT || "stdio";
 
@@ -174,6 +181,9 @@ if (transport === "http") {
           const t = transports.get(sessionId)!;
           await t.handleRequest(req, res, parsedBody);
         } else {
+          // Create a fresh McpServer per session — the SDK does not allow
+          // connecting the same server instance to multiple transports.
+          const sessionServer = createServer();
           const t = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (id) => {
@@ -184,7 +194,7 @@ if (transport === "http") {
             const id = [...transports.entries()].find(([_, x]) => x === t)?.[0];
             if (id) transports.delete(id);
           };
-          await server.connect(t);
+          await sessionServer.connect(t);
           await t.handleRequest(req, res, parsedBody);
         }
         return;
