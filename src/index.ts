@@ -32,7 +32,7 @@ const server = new McpServer({
 
 registerTools(server);
 
-function createServer() {
+function createMcpServer() {
   const s = new McpServer({ name: "eventflare", version: VERSION });
   registerTools(s);
   return s;
@@ -183,7 +183,7 @@ if (transport === "http") {
         } else {
           // Create a fresh McpServer per session — the SDK does not allow
           // connecting the same server instance to multiple transports.
-          const sessionServer = createServer();
+          const sessionServer = createMcpServer();
           const t = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
             onsessioninitialized: (id) => {
