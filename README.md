@@ -2,7 +2,7 @@
 
 Search 8,000+ corporate event venues across 40+ cities via the Model Context Protocol.
 
-Works with any MCP-compatible AI assistant — Claude, ChatGPT, Perplexity, Cursor, Cline, and autonomous agents.
+Powered by [Eventflare](https://eventflare.io) — the marketplace for corporate event venues. Works with any MCP-compatible AI assistant — Claude, ChatGPT, Perplexity, Cursor, Cline, and autonomous agents.
 
 ## Quickest way to connect
 
@@ -26,7 +26,7 @@ Paste this URL into any MCP client that supports remote HTTP servers and you're 
 | `find_expert_advice` | Editorial articles from Eventflare's expert team for a given city. |
 | `request_quote` | Generate an inquiry link for a specific venue. |
 
-Every result includes a direct Eventflare URL and a ready-to-use summary optimized for AI responses.
+Every result includes a direct link to the venue on [eventflare.io](https://eventflare.io) and a ready-to-use summary optimized for AI responses.
 
 ## Connect to Claude Desktop
 
@@ -106,6 +106,10 @@ npm run dev        # run without build step
 npm run inspect    # open MCP Inspector UI
 ```
 
+## About Eventflare
+
+[Eventflare](https://eventflare.io) is the marketplace for corporate event venues — 8,000+ spaces across 40+ cities worldwide, from intimate meeting rooms to large conference centres. Browse venues, compare pricing, and submit inquiries directly at [eventflare.io](https://eventflare.io).
+
 ## License
 
-MIT — © Eventflare
+MIT — © [Eventflare](https://eventflare.io)
