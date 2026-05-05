@@ -4,6 +4,8 @@ Search 8,000+ corporate event venues across 40+ cities via the Model Context Pro
 
 Powered by [Eventflare](https://eventflare.io) — the marketplace for corporate event venues. Works with any MCP-compatible AI assistant — Claude, ChatGPT, Perplexity, Cursor, Cline, and autonomous agents.
 
+[![MCP Badge](https://lobehub.com/badge/mcp/mluckx-eventflare-mcp-server)](https://lobehub.com/mcp/mluckx-eventflare-mcp-server)
+
 ## Quickest way to connect
 
 **Hosted endpoint — no setup required:**
